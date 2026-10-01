@@ -80,23 +80,31 @@ def safe_messagebox(tipo, titulo, mensaje):
 
 # ============= VALIDACIONES DE ENTORNO Y SEGURIDAD =============
 def obtener_id_pc():
-    try:
-        output = subprocess.check_output("wmic csproduct get UUID", shell=True)
-        lines = output.decode().splitlines()
-        for line in lines:
-            line = line.strip()
-            if line and line.lower() != "uuid":
-                return line.upper()
-        return None
-    except Exception:
-        return None
+    """UUID de la PC. Usa wmic y, si no existe (Windows 11 reciente), PowerShell."""
+    comandos = [
+        "wmic csproduct get UUID",
+        'powershell -NoProfile -Command "(Get-CimInstance Win32_ComputerSystemProduct).UUID"',
+    ]
+    for cmd in comandos:
+        try:
+            output = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL)
+            for line in output.decode(errors="ignore").splitlines():
+                line = line.strip()
+                if line and line.lower() != "uuid":
+                    return line.upper()
+        except Exception:
+            continue
+    return None
 
 def verificar_pc():
     id_pc = obtener_id_pc()
+    print(f"[Verificación PC] UUID detectado: {id_pc}")
     if not id_pc:
+        print("[Verificación PC] ERROR: no se pudo obtener el UUID de la PC.")
         safe_messagebox("error", "Error", "No se pudo obtener el UUID de la PC.")
         return False
     if id_pc.replace("-", "").upper() not in [pc.replace("-", "").upper() for pc in PC_PERMITIDAS]:
+        print(f"[Verificación PC] ERROR: PC no autorizada. UUID: {id_pc}")
         safe_messagebox("error", "PC no autorizada", f"Este programa no está autorizado para esta PC.\nUUID: {id_pc}")
         return False
     return True
