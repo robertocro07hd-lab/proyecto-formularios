@@ -35,7 +35,9 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 # ============= CONFIGURACIÓN =============
-pytesseract.pytesseract.tesseract_cmd = r"C:\Users\rrobles\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+RUTA_TESSERACT = r"C:\Users\rrobles\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+if os.path.exists(RUTA_TESSERACT):
+    pytesseract.pytesseract.tesseract_cmd = RUTA_TESSERACT
 
 LICENCIA = "eyJle-HAiOi-IyMDI-2LTA5-LTI0I-n0uwy-I2_4P-Nt5oG-k0iX3-CIPmr-p6HAX-Q0YmN-sa4t3-oZsYI-g"
 DURACION_MESES = 6
@@ -228,7 +230,7 @@ PATRON_CODIGO_CASILLERO = re.compile(r'^\d{3,4}$')
 PATRON_VALOR_NUMERICO = re.compile(r'^-?\$?\d[\d,]*(?:\.\d+)?$|^-?\$?\.\d+$')
 PATRON_RESPUESTA_TEXTO = re.compile(r'^(?:SI|SÍ|NO|NO APLICA)$', re.IGNORECASE)
 MAX_ANCHO_CAJA = 130
-MAX_ALTO_CAJA = 40
+MAX_ALTO_CAJA = 90
 
 def _es_color_casillero(color):
     """Celeste, naranja, azules = casillero. Blanco y grises = celdas de valor/texto."""
@@ -245,15 +247,18 @@ def _extraer_casilleros_por_recuadro(ruta_pdf):
     casilleros = {}
     origen = {}
     registro_debug = []
+    paginas_sin_vector = []   # páginas escaneadas/imagen: se resuelven por OCR
     try:
         with pdfplumber.open(ruta_pdf) as pdf:
             for num_pag, pagina in enumerate(pdf.pages, 1):
                 cajas = [r for r in pagina.rects
                          if _es_color_casillero(r.get('non_stroking_color'))
                          and r['width'] < MAX_ANCHO_CAJA and r['height'] < MAX_ALTO_CAJA]
-                if not cajas:
-                    continue
                 palabras = pagina.extract_words(x_tolerance=1.5, y_tolerance=2)
+                if not cajas:
+                    if len(palabras) < 20:
+                        paginas_sin_vector.append(num_pag)
+                    continue
 
                 def caja_de(w):
                     cx = (w['x0'] + w['x1']) / 2
@@ -306,15 +311,266 @@ def _extraer_casilleros_por_recuadro(ruta_pdf):
                                                'valor': valor, 'origen': origen[codigo]})
     except Exception:
         pass
+    return casilleros, origen, registro_debug, paginas_sin_vector
+
+# ============= OCR PARA PDF ESCANEADOS (imagen) =============
+# Mismo criterio que el método vectorial: casillero = número de 3-4 dígitos sobre
+# fondo de color; valor = número a su derecha en la misma fila.
+OCR_DPI = 300
+PATRON_VALOR_OCR = re.compile(r'^-?\$?\d[\d,]*\.\d{2,6}$|^-?\$?\d{1,15}$')
+
+def _fondo_es_color(img_rgb, x0, y0, x1, y1):
+    """Color de fondo dominante de la caja de la palabra (ignora el trazo del texto)."""
+    w, h = img_rgb.size
+    x0, y0 = max(0, int(x0) - 3), max(0, int(y0) - 1)
+    x1, y1 = min(w, int(x1) + 3), min(h, int(y1) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return False
+    muestra = img_rgb.crop((x0, y0, x1, y1)).quantize(colors=4).convert("RGB")
+    cuentas = muestra.getcolors(maxcolors=16) or []
+    if not cuentas:
+        return False
+    _, color = max(cuentas, key=lambda t: t[0])
+    return (max(color) - min(color)) > 0.08 * 255 and min(color) < 0.97 * 255
+
+def _palabras_ocr(img):
+    """OCR normal + OCR invertido (texto blanco sobre azul oscuro). Une sin duplicar."""
+    from PIL import ImageOps
+    gris = img.convert("L")
+    palabras = []
+    for variante in (gris, ImageOps.invert(gris)):
+        try:
+            d = pytesseract.image_to_data(variante, lang="spa", config="--psm 11",
+                                          output_type=pytesseract.Output.DICT)
+        except Exception:
+            d = pytesseract.image_to_data(variante, config="--psm 11",
+                                          output_type=pytesseract.Output.DICT)
+        for i, t in enumerate(d["text"]):
+            t = (t or "").strip()
+            if not t:
+                continue
+            w = {"text": t, "x0": d["left"][i], "x1": d["left"][i] + d["width"][i],
+                 "top": d["top"][i], "bottom": d["top"][i] + d["height"][i]}
+            cx, cy = (w["x0"] + w["x1"]) / 2, (w["top"] + w["bottom"]) / 2
+            duplicada = any(abs(cx - (o["x0"] + o["x1"]) / 2) < 6 and abs(cy - (o["top"] + o["bottom"]) / 2) < 6
+                            for o in palabras)
+            if not duplicada:
+                palabras.append(w)
+    return palabras
+
+PATRON_DECIMAL_OCR = re.compile(r'^-?\d[\d,]*\.\d{2,6}$')
+OPERADORES_FORMULA = re.compile(r'^[\(\-\+=\*/]+\)?$|^(?:campo|campos|casillero|casilleros|y|más|mas|menos)$', re.IGNORECASE)
+
+def _limpiar_valor_ocr(texto):
+    """Quita ruido de bordes de celda (— | _ ~ ') delante del número; conserva '-' (negativo)."""
+    t = texto.strip()
+    t = re.sub(r'^[\u2014\u2013\u2012|_~\'`.,:;]+', '', t)
+    t = re.sub(r'[|_~\'`:;]+$', '', t)
+    return _limpiar_valor(t)
+
+def _es_parte_de_formula(w, palabras, k_dpi):
+    """620+621, '399 - 898', '(trasládese campo 429) 482': el código va pegado a un operador/texto."""
+    alto = max(w["bottom"] - w["top"], 1)
+    cy = (w["top"] + w["bottom"]) / 2
+    fila = [x for x in palabras if x is not w and abs((x["top"] + x["bottom"]) / 2 - cy) <= 0.8 * alto]
+    izq = [x for x in fila if x["x1"] <= w["x0"] + 2 and w["x0"] - x["x1"] <= 5 * k_dpi]
+    der = [x for x in fila if x["x0"] >= w["x1"] - 2 and x["x0"] - w["x1"] <= 5 * k_dpi]
+    if izq:
+        t = max(izq, key=lambda x: x["x1"])["text"]
+        if OPERADORES_FORMULA.fullmatch(t):
+            return True
+    if der:
+        t = min(der, key=lambda x: x["x0"])["text"]
+        if re.fullmatch(r'[\-\+=\*/]+', t):
+            return True
+    return False
+
+def _banda_tiene_color(img, x0, y0, x1, y1):
+    w, h = img.size
+    x0, y0, x1, y1 = max(0, int(x0)), max(0, int(y0)), min(w, int(x1)), min(h, int(y1))
+    if x1 - x0 < 4 or y1 - y0 < 2:
+        return False
+    muestra = img.crop((x0, y0, x1, y1)).quantize(colors=6).convert("RGB")
+    total = (x1 - x0) * (y1 - y0)
+    for cuenta, color in (muestra.getcolors(maxcolors=64) or []):
+        if cuenta > 0.03 * total and (max(color) - min(color)) > 0.08 * 255 and min(color) < 0.97 * 255:
+            return True
+    return False
+
+def _pixel_es_color(p):
+    return (max(p) - min(p)) > 0.08 * 255 and min(p) < 0.97 * 255
+
+def _celdas_color_en_fila(img, x0, x1, y_a, y_b, hueco_max=3):
+    """Tramos horizontales de fondo coloreado (celdas) en una franja. Devuelve [(x_ini, x_fin)]."""
+    w, h = img.size
+    x0, x1 = max(0, int(x0)), min(w, int(x1))
+    ya, yb = min(max(0, int(y_a)), h - 1), min(max(0, int(y_b)), h - 1)
+    px = img.load()
+    tramos, ini, ultimo, huecos = [], None, None, 0
+    for x in range(x0, x1):
+        col = _pixel_es_color(px[x, ya]) or _pixel_es_color(px[x, yb])
+        if col:
+            if ini is None:
+                ini = x
+            ultimo, huecos = x, 0
+        elif ini is not None:
+            huecos += 1
+            if huecos > hueco_max:
+                tramos.append((ini, ultimo))
+                ini = None
+    if ini is not None:
+        tramos.append((ini, ultimo))
+    return tramos
+
+def _ocr_codigo_en_celda(img, x0, y0, x1, y1):
+    """OCR de dígitos dentro de UNA celda coloreada (normal e invertido). Devuelve texto de 3-4 dígitos o None."""
+    from PIL import ImageOps
+    recorte = img.crop((int(x0) + 2, int(y0), int(x1) - 2, int(y1)))
+    if recorte.width < 8 or recorte.height < 8:
+        return None
+    ampliado = recorte.resize((recorte.width * 2, recorte.height * 2), Image.LANCZOS).convert("L")
+    for variante in (ampliado, ImageOps.invert(ampliado)):
+        try:
+            t = pytesseract.image_to_string(
+                variante, config="--psm 7 -c tessedit_char_whitelist=0123456789").strip()
+        except Exception:
+            continue
+        if PATRON_CODIGO_CASILLERO.fullmatch(t):
+            return t
+    return None
+
+def _reocr_valor(img, x, original, margen=6):
+    """
+    Re-lee un monto que el OCR devolvió sin decimales (ej. 6242944 en vez de 6242944.17).
+    Amplía el recorte hacia la derecha (donde estaban los decimales perdidos). Los montos del SRI
+    siempre llevan 2 decimales: si el OCR pierde el punto pero entrega 2 dígitos más, se reconstruye.
+    """
+    from PIL import ImageOps
+    base = original.lstrip("-")
+    for ext in (60, 30, 0):
+        recorte = img.crop((int(x["x0"]) - margen, int(x["top"]) - margen, int(x["x1"]) + ext, int(x["bottom"]) + margen))
+        ampliado = recorte.resize((recorte.width * 3, recorte.height * 3), Image.LANCZOS).convert("L")
+        for variante in (ampliado, ImageOps.invert(ampliado)):
+            try:
+                t = pytesseract.image_to_string(
+                    variante, config="--psm 7 -c tessedit_char_whitelist=0123456789.,-").strip()
+            except Exception:
+                continue
+            t = _limpiar_valor_ocr(t)
+            if PATRON_DECIMAL_OCR.fullmatch(t) and t.lstrip("-").split(".")[0] == base:
+                return t
+            solo = t.lstrip("-").replace(".", "")
+            if solo.startswith(base) and len(solo) == len(base) + 2 and solo.isdigit():
+                return ("-" if original.startswith("-") else "") + base + "." + solo[-2:]
+    return None
+
+def _extraer_casilleros_ocr(ruta_pdf, paginas):
+    casilleros = {}
+    origen = {}
+    registro_debug = []
+    if not paginas:
+        return casilleros, origen, registro_debug
+    try:
+        doc = fitz.open(ruta_pdf)
+    except Exception:
+        return casilleros, origen, registro_debug
+    for num_pag in paginas:
+        try:
+            pix = doc[num_pag - 1].get_pixmap(dpi=OCR_DPI)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            palabras = _palabras_ocr(img)
+        except Exception:
+            continue
+        k_dpi = OCR_DPI / 72.0
+        codigos = [w for w in palabras
+                   if PATRON_CODIGO_CASILLERO.fullmatch(w["text"])
+                   and _fondo_es_color(img, w["x0"], w["top"], w["x1"], w["bottom"])
+                   and not _es_parte_de_formula(w, palabras, k_dpi)]
+        reclamados = set()
+        for w in codigos:
+            alto = max(w["bottom"] - w["top"], 1)
+            cy = (w["top"] + w["bottom"]) / 2
+            en_fila = lambda x: abs((x["top"] + x["bottom"]) / 2 - cy) <= 0.8 * alto
+            limite = min([c["x0"] for c in codigos if c is not w and c["x0"] > w["x1"] and en_fila(c)] or [1e9])
+            derecha = sorted([x for x in palabras
+                              if x["x0"] >= w["x1"] and x["x0"] < limite and en_fila(x)],
+                             key=lambda x: x["x0"])
+            valor = ""
+            dudoso = False
+            for x in derecha:
+                t = _limpiar_valor_ocr(x["text"].replace("O", "0").replace("o", "0"))
+                if PATRON_VALOR_OCR.fullmatch(t) and not PATRON_CODIGO_CASILLERO.fullmatch(t):
+                    if "." not in t and len(t.lstrip("-")) > 3:
+                        t_fix = _reocr_valor(img, x, t)   # monto sin decimales: probablemente OCR truncado
+                        if t_fix:
+                            t = t_fix
+                        else:
+                            dudoso = True
+                    valor = t
+                    reclamados.add(id(x))
+                    break
+            if not valor:
+                for x in derecha:
+                    t = _limpiar_valor_ocr(x["text"])
+                    if t == "0":
+                        valor = "0"
+                        reclamados.add(id(x))
+                        break
+            codigo = w["text"]
+            if codigo not in casilleros or (casilleros[codigo] == "" and valor != ""):
+                casilleros[codigo] = valor
+                origen[codigo] = ("ocr_revisar" if dudoso else "ocr_recuadro") if valor else "ocr_sin_valor"
+                registro_debug.append({"pagina": num_pag, "codigo": codigo,
+                                       "valor": valor, "origen": origen[codigo]})
+        # --- Recuperación: valores sin casillero (el OCR no leyó el código, ej. fondo oscuro)
+        for v in palabras:
+            if id(v) in reclamados:
+                continue
+            tv = _limpiar_valor_ocr(v["text"])
+            if not PATRON_DECIMAL_OCR.fullmatch(tv):
+                continue
+            alto = max(v["bottom"] - v["top"], 1)
+            cy = (v["top"] + v["bottom"]) / 2
+            x_ini = max(0, v["x0"] - 140 * k_dpi)
+            y0, y1 = cy - 0.9 * alto, cy + 0.9 * alto
+            if not _banda_tiene_color(img, x_ini, cy - 0.3 * alto, v["x0"] - 2, cy + 0.3 * alto):
+                continue
+            conocidos = [c for c in codigos if abs((c["top"] + c["bottom"]) / 2 - cy) <= 0.8 * alto]
+            tramos = _celdas_color_en_fila(img, x_ini, v["x0"] - 2, cy - 0.65 * alto, cy + 0.65 * alto)
+            codigo = None
+            for t0, t1 in sorted(tramos, key=lambda t: -t[1]):  # de derecha a izquierda
+                ancho = t1 - t0
+                if ancho < 6 * k_dpi or ancho > 130 * k_dpi:
+                    continue
+                if any(c["x0"] - 8 <= (t0 + t1) / 2 <= c["x1"] + 8 or t0 <= c["x0"] <= t1 for c in conocidos):
+                    break  # el tramo más cercano ya es un casillero conocido: el valor es de ese
+                cand = _ocr_codigo_en_celda(img, t0, cy - 0.9 * alto, t1, cy + 0.9 * alto)
+                if cand:
+                    codigo = cand
+                break
+            if codigo and codigo not in casilleros:
+                casilleros[codigo] = tv
+                origen[codigo] = "ocr_recuperado"
+                reclamados.add(id(v))
+                registro_debug.append({"pagina": num_pag, "codigo": codigo,
+                                       "valor": tv, "origen": "ocr_recuperado"})
+    doc.close()
     return casilleros, origen, registro_debug
 
 def extraer_casilleros_mejorado(ruta_pdf, texto_completo, tablas, valores_excluir):
     """
-    1. Recuadros de color (preciso, método principal)
-    2. OCR/texto: solo si el PDF no tiene recuadros (escaneado)
-    3. Tablas: complemento solo si no hubo recuadros
+    1. Recuadros de color vectoriales (PDF original del SRI, método principal)
+    2. OCR con detección de fondo de color (páginas escaneadas / imagen)
+    3. Texto y tablas: último recurso si no se detectó ningún recuadro
     """
-    casilleros, origen, debug = _extraer_casilleros_por_recuadro(ruta_pdf)
+    casilleros, origen, debug, paginas_imagen = _extraer_casilleros_por_recuadro(ruta_pdf)
+    if paginas_imagen:
+        c_ocr, o_ocr, d_ocr = _extraer_casilleros_ocr(ruta_pdf, paginas_imagen)
+        for cod, val in c_ocr.items():
+            if cod not in casilleros:
+                casilleros[cod] = val
+                origen[cod] = o_ocr[cod]
+        debug.extend(d_ocr)
     if casilleros:
         return casilleros, origen, debug
 
@@ -411,33 +667,38 @@ def extraer_metadatos(texto_completo, lineas):
     return meta
 
 def extraer_mes_inteligente(texto_completo, periodo_str):
-    """Extrae el mes del período del formulario (formato MM/AAAA)."""
-    if not texto_completo or not periodo_str:
-        return "Desconocido"
-
+    """
+    Devuelve el período como MM/AAAA (mensual) o 'Anual AAAA' (formulario anual, ej. 101).
+    Solo mira el texto del PERÍODO (no el resto del formulario).
+    """
     meses_nombres = {
         "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
         "MAYO": 5, "JUNIO": 6, "JULIO": 7, "AGOSTO": 8,
         "SEPTIEMBRE": 9, "OCTUBRE": 10, "NOVIEMBRE": 11, "DICIEMBRE": 12
     }
+    candidatos = []
+    if periodo_str and periodo_str != "No detectado":
+        candidatos.append(periodo_str)
+    if texto_completo:
+        for m in re.finditer(r'PER[IÍ]ODO\s+FISCAL\s*:?\s*([^\n]+)|(?:^|\n)\s*(?:MES|PER[IÍ]ODO)\s*:?\s*([^\n]+)',
+                             texto_completo, re.IGNORECASE):
+            candidatos.append(m.group(1) or m.group(2))
+        for m in re.finditer(r'(?:^|\n)\s*A[ÑN]O\s*:?\s*(20\d{2})', texto_completo, re.IGNORECASE):
+            candidatos.append("AÑO " + m.group(1))
 
-    match_mes = re.search(r'(\d{1,2})\s*[\/\-]\s*(\d{4})', periodo_str)
-    if match_mes:
-        mes_num = int(match_mes.group(1))
-        anio = match_mes.group(2)
-        if 1 <= mes_num <= 12:
-            return f"{mes_num:02d}/{anio}"
-
-    texto_upper = texto_completo.upper()
-    for mes_nombre, mes_num in meses_nombres.items():
-        if mes_nombre in texto_upper:
-            idx = texto_upper.find(mes_nombre)
-            contexto = texto_upper[max(0, idx - 50):idx + 100]
-            match_anio = re.search(r'(\d{4})', contexto)
-            if match_anio:
-                return f"{mes_num:02d}/{match_anio.group(1)}"
-            return f"{mes_num:02d}/2026"
-
+    for cand in candidatos:
+        up = cand.upper()
+        m_num = re.search(r'\b(\d{1,2})\s*[\/\-]\s*(20\d{2})\b', up)
+        if m_num and 1 <= int(m_num.group(1)) <= 12:
+            return f"{int(m_num.group(1)):02d}/{m_num.group(2)}"
+        for nombre, num in meses_nombres.items():
+            if re.search(r'\b' + nombre + r'\b', up):
+                m_anio = re.search(r'\b(20\d{2})\b', up)
+                if m_anio:
+                    return f"{num:02d}/{m_anio.group(1)}"
+        m_anual = re.search(r'\bA[ÑN]O\s*:?\s*(20\d{2})\b', up)
+        if m_anual:
+            return f"Anual {m_anual.group(1)}"
     return "Desconocido"
 
 # ============= VALIDACIÓN =============
@@ -483,6 +744,7 @@ def extraer_datos_formulario_sri(ruta_pdf):
     )
 
     validacion = validar_datos_mejorado(meta, casilleros)
+    validacion["casilleros_a_revisar"] = sum(1 for o in origen.values() if o in ("ocr_revisar", "ocr_sin_valor"))
     mes_formulario = extraer_mes_inteligente(texto_completo, meta.get("Periodo", ""))
 
     return {
@@ -1273,6 +1535,9 @@ def crear_pestana(datos):
     texto_estado = "✔ EXTRACCIÓN COMPLETA Y VALIDADA" if val["completo"] else "⚠ REVISAR: FALTAN DATOS CLAVE"
     lbl_estado = tk.Label(frame, text=texto_estado, font=("Tahoma", 10, "bold"), fg=color_estado, bg="white")
     lbl_estado.pack(pady=(8, 4), anchor="w", padx=10)
+    if val.get("casilleros_a_revisar", 0) > 0:
+        tk.Label(frame, text=f"⚠ {val['casilleros_a_revisar']} casillero(s) leídos por OCR con baja confianza: verificar contra el PDF",
+                 font=("Tahoma", 8, "bold"), fg="#e65100", bg="white").pack(anchor="w", padx=10)
     frame_check = tk.Frame(frame, bg="white")
     frame_check.pack(fill="x", padx=10)
     checks = [
