@@ -25,7 +25,6 @@ from PIL import Image
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog
 from tkinterdnd2 import TkinterDnD, DND_FILES
-import subprocess
 import datetime
 import json
 import os
@@ -41,24 +40,6 @@ if os.path.exists(RUTA_TESSERACT):
 
 LICENCIA = "eyJle-HAiOi-IyMDI-2LTA5-LTI0I-n0uwy-I2_4P-Nt5oG-k0iX3-CIPmr-p6HAX-Q0YmN-sa4t3-oZsYI-g"
 DURACION_MESES = 6
-PC_PERMITIDAS = [
-    "502F9BD8-60AD-2021-0313-215813000000",
-    "3860C001-F5AF-22FA-86A5-04D9F536B69F",
-    "32444335-3134-5A36-584C-4C5A31344435",
-    "4C4C4544-0036-4B10-8043-CAC04F564833",
-    "EC41AD4C-22BB-11B2-A85C-8F5A5A1C8F26",
-    "20257CCC-29F8-11B2-A85C-D85EB30720BE",
-    "5E83674C-34E1-11B2-A85C-C184CF5F4D78",
-    "B7BD0DCC-2DF2-11B2-A85C-99DF4B7597B1",
-    "1062214C-31CC-11B2-A85C-F72F34BA12A2",
-    "AFE0405A-AEA1-214A-A77F-397C51084A22",
-    "E154BEDC-4841-E74D-B582-A66C6F50C142",
-    "33296BCC-204C-11B2-A85C-E7B42424187D",
-    "3ACF52E1-B287-244B-8BD7-436D5B259217",
-    "31444335-3834-3044-5831-313038344435",
-    "B52343CC-324A-11B2-A85C-8905A1FFA177",
-]
-
 RUTA_CONFIG = os.path.join(os.path.expanduser("~"), "voucheo_config.json")
 
 # Listas globales
@@ -78,37 +59,7 @@ def safe_messagebox(tipo, titulo, mensaje):
         messagebox.showerror(titulo, mensaje, parent=dummy)
     dummy.destroy()
 
-# ============= VALIDACIONES DE ENTORNO Y SEGURIDAD =============
-def obtener_id_pc():
-    """UUID de la PC. Usa wmic y, si no existe (Windows 11 reciente), PowerShell."""
-    comandos = [
-        "wmic csproduct get UUID",
-        'powershell -NoProfile -Command "(Get-CimInstance Win32_ComputerSystemProduct).UUID"',
-    ]
-    for cmd in comandos:
-        try:
-            output = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL)
-            for line in output.decode(errors="ignore").splitlines():
-                line = line.strip()
-                if line and line.lower() != "uuid":
-                    return line.upper()
-        except Exception:
-            continue
-    return None
-
-def verificar_pc():
-    id_pc = obtener_id_pc()
-    print(f"[Verificación PC] UUID detectado: {id_pc}")
-    if not id_pc:
-        print("[Verificación PC] ERROR: no se pudo obtener el UUID de la PC.")
-        safe_messagebox("error", "Error", "No se pudo obtener el UUID de la PC.")
-        return False
-    if id_pc.replace("-", "").upper() not in [pc.replace("-", "").upper() for pc in PC_PERMITIDAS]:
-        print(f"[Verificación PC] ERROR: PC no autorizada. UUID: {id_pc}")
-        safe_messagebox("error", "PC no autorizada", f"Este programa no está autorizado para esta PC.\nUUID: {id_pc}")
-        return False
-    return True
-
+# ============= LICENCIA =============
 def verificar_licencia():
     if os.path.exists(RUTA_CONFIG):
         with open(RUTA_CONFIG, "r") as f:
@@ -1705,7 +1656,7 @@ def limpiar_ats_todo():
     refrescar_resumen_ats()
 
 # ============= CONSTRUCCIÓN DE LA VENTANA =============
-if __name__ == "__main__" and verificar_pc():
+if __name__ == "__main__":
     ventana = TkinterDnD.Tk()
     ventana.title("Sistema de Gestión Tributaria - Extractor de Precisión SRI (v3.0)")
     ventana.geometry("980x720")
